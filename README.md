@@ -115,3 +115,4 @@ doesn't care about 802.11 frame type), but only deauth was actually exercised. 2
   device. Worth telling the owner; unrelated to the dongle or any driver change here.
 # zt9101
 # zt9101
+# zt9101
