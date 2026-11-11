@@ -1,0 +1,300 @@
+diff --git a/src/mak/linux/Makefile b/src/mak/linux/Makefile
+index cb90430..4d782bb 100644
+--- a/src/mak/linux/Makefile
++++ b/src/mak/linux/Makefile
+@@ -101,6 +101,7 @@ endif
+ 
+ ifeq ($(CONFIG_WIFI_MODE), monitor)
+ ccflags-y += -DCFG_ENABLE_MONITOR_MODE
++ccflags-y += -DCONFIG_WIFI_MONITOR
+ endif
+ 
+ ifeq ($(CONFIG_WIFI_MODE), adhoc)
+@@ -111,6 +112,7 @@ ifeq ($(CONFIG_WIFI_MODE), all)
+ ccflags-y += -DCFG_ENABLE_AP_MODE
+ ccflags-y += -DCFG_ENABLE_ADHOC_MODE
+ ccflags-y += -DCFG_ENABLE_MONITOR_MODE
++ccflags-y += -DCONFIG_WIFI_MONITOR
+ ccflags-y += -DZT_WEP_AUTH_ENABLE_WEXT
+ endif
+ 
+diff --git a/src/nic/nic.h b/src/nic/nic.h
+index a7f0278..2cb9a83 100644
+--- a/src/nic/nic.h
++++ b/src/nic/nic.h
+@@ -138,6 +138,7 @@ typedef struct nic_info
+     zt_u8 *hw_ch;
+     zt_u8 *hw_bw;
+     zt_u8 *hw_offset;
++    zt_u8 mon_channel;   /* channel the monitor interface is tuned to (0 = unset) */
+ } nic_info_st;
+ 
+ zt_s32 nic_init(nic_info_st *nic_info);
+diff --git a/src/nic/rx.c b/src/nic/rx.c
+index 20e03eb..b3a5458 100644
+--- a/src/nic/rx.c
++++ b/src/nic/rx.c
+@@ -747,7 +747,7 @@ static zt_s32 rx_set_radiotap_hdr(prx_pkt_t ppkt)
+         hdr_buf[rt_len] |= ZT_RADIOTAP_FRAG;
+     }
+ 
+-    hdr_buf[rt_len] |= ZT_RADIOTAP_FCS;
++    /* the chip delivers frames without FCS: do not claim one (readers would cut 4 bytes) */
+ 
+     if (pinfo->crc_err)
+     {
+@@ -769,7 +769,7 @@ static zt_s32 rx_set_radiotap_hdr(prx_pkt_t ppkt)
+ 
+     tmp_16bit = 0;
+     prtap_hdr->it_present |= (1 << ZT_RADIOTAP_CHANNEL);
+-    tmp_16bit = zt_ch_2_freq(pcur_network->channel);
++    tmp_16bit = zt_ch_2_freq(pnic_info->mon_channel ? pnic_info->mon_channel : pcur_network->channel);
+     zt_memcpy(&hdr_buf[rt_len], &tmp_16bit, 2);
+     rt_len += 2;
+ 
+@@ -796,8 +796,10 @@ static zt_s32 rx_set_radiotap_hdr(prx_pkt_t ppkt)
+     rt_len += 2;
+ 
+     prtap_hdr->it_present |= (1 << ZT_RADIOTAP_DBM_ANTSIGNAL);
+-    //  hdr_buf[rt_len] = pinfo->phy_info.RecvSignalPower;
+-    hdr_buf[rt_len] = 0;
++    /* signal_strength is a 0..100 percentage (dBm = percentage - 100, as scan results use);
++     * phy_status.rssi is never filled (#if 0 above). Control frames carry no PHY status. */
++    hdr_buf[rt_len] = pinfo->phy_status ?
++                      (zt_u8)((zt_s32)ppkt->phy_status.signal_strength - 100) : 0;
+     rt_len += 1;
+ 
+     prtap_hdr->it_present |= (1 << ZT_RADIOTAP_ANTENNA);
+diff --git a/src/os/linux/cfg80211/zt_cfg80211.c b/src/os/linux/cfg80211/zt_cfg80211.c
+index 2637629..e6f41ce 100644
+--- a/src/os/linux/cfg80211/zt_cfg80211.c
++++ b/src/os/linux/cfg80211/zt_cfg80211.c
+@@ -25,6 +25,37 @@
+ #include "zt_cfg80211.h"
+ #include "android/android_priv_cmd.h"
+ 
++#ifdef CFG_ENABLE_MONITOR_MODE
++/* Monitor mode: open the chip's receive filter (RCR) so management, control and data frames
++ * of every BSSID reach the host. Uses the same MCU command as the factory-test RX filter. */
++#define ZT_MON_RCR_AAP   ZT_BIT(0)
++#define ZT_MON_RCR_APM   ZT_BIT(1)
++#define ZT_MON_RCR_AM    ZT_BIT(2)
++#define ZT_MON_RCR_AB    ZT_BIT(3)
++#define ZT_MON_RCR_ADF   ZT_BIT(11)
++#define ZT_MON_RCR_ACF   ZT_BIT(12)
++#define ZT_MON_RCR_AMF   ZT_BIT(13)
++#define ZT_MON_RCR_HTC   ZT_BIT(14)
++#define ZT_MON_RCR_PHYST ZT_BIT(28)
++static void zt_monitor_set_rx_filter(nic_info_st *pnic_info, zt_bool on)
++{
++    zt_u32 inbuff[3] = { 0 };
++
++    if (on)
++    {
++        inbuff[0] = 1;
++        inbuff[1] = ZT_MON_RCR_AAP | ZT_MON_RCR_APM | ZT_MON_RCR_AM | ZT_MON_RCR_AB |
++                    ZT_MON_RCR_ADF | ZT_MON_RCR_ACF | ZT_MON_RCR_AMF | ZT_MON_RCR_HTC |
++                    ZT_MON_RCR_PHYST;
++        inbuff[2] = zt_true;
++    }
++    if (mcu_cmd_communicate(pnic_info, UMSG_OPS_MP_SET_PRX, inbuff, 3, NULL, 0) == ZT_RETURN_FAIL)
++    {
++        LOG_W("monitor: set rx filter failed");
++    }
++}
++#endif
++
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0))
+ #define ZT_STA_EVENT_DEV(ndev) ((ndev)->ieee80211_ptr)
+ #else
+@@ -1326,6 +1357,19 @@ static zt_s32 _cfg80211_change_iface(struct wiphy *wiphy,
+     zt_memset(pnic_info->sec_info, 0, sizeof(sec_info_st));
+     zt_local_cfg_set_work_mode(pnic_info, network_type);
+     zt_mcu_set_op_mode(pnic_info, network_type);
++#ifdef CFG_ENABLE_MONITOR_MODE
++    if (network_type == ZT_MONITOR_MODE)
++    {
++        zt_monitor_set_rx_filter(pnic_info, zt_true);
++        /* The vendor driver ties the kernel netif TX queue state to "associated to an AP"
++         * (zt_os_api_disable_all_data_queue on disconnect stops all queues + drops carrier;
++         * nothing ever re-enables them for monitor mode, since monitor never associates).
++         * With queues left stopped, dev_queue_xmit's qdisc layer drops every injected frame
++         * before ndo_start_xmit is ever called -- independent of anything work_monitor_tx_entry
++         * does. Use the same helper the normal connect-success path uses to re-open them. */
++        zt_os_api_enable_all_data_queue(ndev);
++    }
++#endif
+ 
+     return 0;
+ }
+@@ -3068,7 +3112,69 @@ static zt_s32 _set_monitor_channel(struct wiphy *wiphy
+ #endif
+                                   )
+ {
++    nic_info_st *pnic_info = *((nic_info_st **)wiphy_priv(wiphy));
++    zt_s32 chan_offset = HAL_PRIME_CHNL_OFFSET_DONT_CARE;
++    zt_s32 chan_width = CHANNEL_WIDTH_20;
++    zt_u8 chan_target;
+ 
++    if (pnic_info == NULL || chandef == NULL || chandef->chan == NULL)
++    {
++        return -EINVAL;
++    }
++    if (ZT_CANNOT_RUN(pnic_info))
++    {
++        return -EPERM;
++    }
++
++    chan_target = (zt_u8) ieee80211_frequency_to_channel(chandef->chan->center_freq);
++    if (chandef->width == NL80211_CHAN_WIDTH_40)
++    {
++        chan_width = CHANNEL_WIDTH_40;
++        chan_offset = (chandef->center_freq1 > chandef->chan->center_freq) ?
++                      HAL_PRIME_CHNL_OFFSET_LOWER : HAL_PRIME_CHNL_OFFSET_UPPER;
++    }
++
++    zt_hw_info_set_channel_bw(pnic_info, chan_target, chan_width, chan_offset);
++    pnic_info->mon_channel = chan_target;
++    return 0;
++}
++#endif
++
++/* Lets `iw dev <if> info` / aireplay-ng's "determine current channel" check read the
++ * channel back: without this op cfg80211 has nothing to report, which made aireplay-ng
++ * refuse to inject (it needs a channel != -1) even though TX itself was fine. */
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0))
++static zt_s32 _get_channel(struct wiphy *wiphy, struct wireless_dev *wdev,
++                          unsigned int link_id, struct cfg80211_chan_def *chandef)
++{
++    nic_info_st *pnic_info = *((nic_info_st **)wiphy_priv(wiphy));
++    zt_u8 ch;
++
++    if (pnic_info == NULL || chandef == NULL)
++    {
++        return -EINVAL;
++    }
++
++    if (wdev && wdev->iftype == NL80211_IFTYPE_MONITOR && pnic_info->mon_channel)
++    {
++        ch = pnic_info->mon_channel;
++    }
++    else
++    {
++        ch = pnic_info->hw_ch ? *pnic_info->hw_ch : 0;
++    }
++    if (ch == 0)
++    {
++        return -ENODATA;
++    }
++
++    chandef->chan = ieee80211_get_channel(wiphy, zt_ch_2_freq((zt_s32)ch));
++    if (chandef->chan == NULL)
++    {
++        return -ENODATA;
++    }
++    chandef->width = NL80211_CHAN_WIDTH_20;
++    chandef->center_freq1 = chandef->chan->center_freq;
+     return 0;
+ }
+ #endif
+@@ -4285,6 +4391,9 @@ static struct cfg80211_ops zt_cfg80211_ops =
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0))
+     .set_monitor_channel = _set_monitor_channel, //
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0))
++    .get_channel = _get_channel,
++#endif
+ #endif
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37)) || defined(COMPAT_KERNEL_RELEASE)
+diff --git a/src/os/linux/netdev/ndev_linux.c b/src/os/linux/netdev/ndev_linux.c
+index f5a79a6..72b0145 100644
+--- a/src/os/linux/netdev/ndev_linux.c
++++ b/src/os/linux/netdev/ndev_linux.c
+@@ -22,6 +22,77 @@
+ #include "hif.h"
+ #include "rx.h"
+ #include "common.h"
++
++#ifdef CFG_ENABLE_MONITOR_MODE
++/* Monitor-mode injection: the skb carries a radiotap header (as written by aireplay-ng,
++ * mdk4 and friends) followed by a raw 802.11 frame. Strip the radiotap header and hand the
++ * raw frame to the *real* management-frame TX path (zt_nic_mgmt_frame_xmit) -- the same one
++ * used for probe requests and auth/assoc frames. The chip does not care what subtype the
++ * 802.11 header says; it only needs the TX descriptor nic_mgmt_frame_xmit builds. This is
++ * the actual HIF path; cfg80211's Mgmt_Tx is a no-op outside P2P and cannot be reused.
++ * No ACK is requested (same as a probe request): injected frames are typically broadcast
++ * or expect no ACK to the attacker, and waiting here would stall the TX queue. */
++static void work_monitor_tx_entry(struct net_device *pnetdev, struct sk_buff *pkt)
++{
++    ndev_priv_st *ndev_priv = netdev_priv(pnetdev);
++    nic_info_st *pnic_info = ndev_priv->nic;
++    tx_info_st *ptx_info;
++    struct xmit_buf *pxmit_buf;
++    struct ieee80211_radiotap_header *prthdr;
++    zt_u16 rt_len;
++    zt_s32 frame_len;
++
++    if (pnic_info == NULL || pnic_info->tx_info == NULL || ZT_CANNOT_RUN(pnic_info))
++    {
++        goto drop;
++    }
++    if (pkt->len < sizeof(struct ieee80211_radiotap_header))
++    {
++        goto drop;
++    }
++    prthdr = (struct ieee80211_radiotap_header *)pkt->data;
++    if (prthdr->it_version != 0)
++    {
++        goto drop;
++    }
++    rt_len = zt_le16_to_cpu(prthdr->it_len);
++    if (rt_len < sizeof(struct ieee80211_radiotap_header) || rt_len > pkt->len)
++    {
++        goto drop;
++    }
++    frame_len = pkt->len - rt_len;
++    /* 10 bytes: shortest 802.11 frame the driver constructs elsewhere (CTS/ACK-class). */
++    if (frame_len < 10 || frame_len > (MAX_XMITBUF_SZ - TXDESC_OFFSET_NEW))
++    {
++        goto drop;
++    }
++
++    ptx_info = pnic_info->tx_info;
++    pxmit_buf = zt_xmit_extbuf_new(ptx_info);
++    if (pxmit_buf == NULL)
++    {
++        goto drop;
++    }
++
++    zt_memset(pxmit_buf->pbuf, 0, TXDESC_OFFSET_NEW);
++    zt_memcpy(pxmit_buf->pbuf + TXDESC_OFFSET_NEW, pkt->data + rt_len, frame_len);
++    pxmit_buf->pkt_len = (zt_u16)frame_len;
++
++    if (zt_nic_mgmt_frame_xmit(pnic_info, NULL, pxmit_buf, pxmit_buf->pkt_len) != 0)
++    {
++        LOG_W("monitor tx: frame submit failed, len=%d", frame_len);
++    }
++    /* zt_nic_mgmt_frame_xmit/zt_io_write_data owns pxmit_buf from here (freed on completion
++     * or, on the ZT_CANNOT_RUN early-out inside nic_mgmt_frame_xmit, immediately). The
++     * driver's own stats (ip -s link) come from tx_info/rx_info internal counters via
++     * ndev_get_stats, not from pnetdev->stats, so there is nothing useful to update there. */
++    zt_free_skb(pkt);
++    return;
++
++drop:
++    zt_free_skb(pkt);
++}
++#endif
+ #ifdef CONFIG_IOCTL_CFG80211
+ #include <linux/nl80211.h>
+ #include <net/cfg80211.h>
+@@ -450,7 +521,7 @@ static zt_s32 ndev_start_xmit(struct sk_buff *skb, struct net_device *ndev)
+ #ifdef CFG_ENABLE_MONITOR_MODE
+     if (zt_mlme_check_mode(ndev_priv->nic, ZT_MONITOR_MODE) == zt_true)
+     {
+-        //work_monitor_tx_entry(pnetdev, (struct sk_buff *)pkt);
++        work_monitor_tx_entry(ndev, skb);
+     }
+     else
+ #endif
